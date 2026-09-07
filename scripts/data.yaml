@@ -1,0 +1,6 @@
+path: /Users/rasya2121/Documents/code/farmora-yolo/datasets/merged
+train: train/images
+val: valid/images
+test: test/images
+
+names: ['cyperus', 'Amaranthus-spinosus']
