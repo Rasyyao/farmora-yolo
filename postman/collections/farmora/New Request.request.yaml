@@ -1,0 +1,13 @@
+$kind: http-request
+url: http://0.0.0.0:8000/detect
+method: POST
+body:
+  type: formdata
+  content:
+    - type: file
+      key: image
+      src:
+        - /Users/rasya2121/Documents/code/farmora-yolo/datasets/merged/real_test_outside_dataset/images-14.jpeg
+      description: ""
+      disabled: false
+order: 1788958847706

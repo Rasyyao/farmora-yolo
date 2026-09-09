@@ -5,6 +5,7 @@ from PIL import Image
 import io
 import os
 from dotenv import load_dotenv
+from google import genai
 
 load_dotenv()
 
@@ -12,26 +13,23 @@ app = FastAPI(title="FARMORA Detection API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for demo purposes; tighten this later if needed
+    allow_origins=["*"],  
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-model = YOLO("../runs/detect/farmora_gulma-4/weights/best.pt")  # this should be the v3 weights, copied in as api/best.pt
+model = YOLO("api/best.pt") 
 
-INFERENCE_IMGSZ = 960  # model was trained at 960, keep inference consistent
+INFERENCE_IMGSZ = 960  
 
-# --- Per-class confidence threshold + recommendation lookup ---
 CLASS_CONFIG = {
     "cyperus": {
         "display_name": "Rumput Teki",
         "min_conf": 0.40,
-        "recommendation": {"type": "Herbisida", "dose_ml": 50},
     },
     "Amaranthus-spinosus": {
         "display_name": "Bayam Duri",
         "min_conf": 0.28,
-        "recommendation": {"type": "Herbisida", "dose_ml": 40},
     },
 }
 
@@ -45,52 +43,46 @@ def severity_from_confidence(conf: float) -> str:
 
 
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # not used yet, placeholder for later
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-3.5-flash"
 
-DUMMY_EXPLANATIONS = {
-    "cyperus": (
-        "Terdeteksi Rumput Teki (Cyperus rotundus) dengan tingkat keyakinan {conf}%. "
-        "Gulma ini dikenal sulit dikendalikan karena sistem rimpang di bawah tanah "
-        "yang menyebar cepat dan bersaing kuat dengan tanaman budidaya untuk nutrisi "
-        "dan air. Penanganan dini disarankan sebelum rimpang menyebar lebih luas."
-    ),
-    "Amaranthus-spinosus": (
-        "Terdeteksi Bayam Duri (Amaranthus spinosus) dengan tingkat keyakinan {conf}%. "
-        "Gulma ini memiliki duri tajam di ketiak daun sebagai ciri khasnya, tumbuh "
-        "cepat, dan dapat mengganggu pertumbuhan tanaman di sekitarnya jika tidak "
-        "segera ditangani."
-    ),
-}
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-async def get_gemini_explanation(class_name: str, confidence: float, image_bytes: bytes = None) -> str:
+async def generate_summary(detections: list) -> str:
     """
-    PLACEHOLDER — returns a dummy explanation string.
-
-    Real implementation (uncomment + fill in when ready):
-
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-
-        prompt = (
-            f"Jelaskan secara singkat dalam Bahasa Indonesia mengenai gulma "
-            f"{class_name} yang terdeteksi dengan confidence {confidence:.0%}, "
-            f"termasuk ciri khas dan mengapa perlu dikendalikan. Maks 3 kalimat."
-        )
-        response = gemini_model.generate_content(prompt)
-        return response.text
+    Generate an action-recommendation paragraph (Bahasa Indonesia) via Gemini Flash,
+    without restating raw model output (species/confidence/severity).
+    Falls back to a static message if no API key is configured or the call fails.
     """
-    template = DUMMY_EXPLANATIONS.get(
-        class_name,
-        "Gulma terdeteksi dengan tingkat keyakinan {conf}%."
+    if not gemini_client:
+        return "Rekomendasi AI tidak tersedia (GEMINI_API_KEY belum dikonfigurasi)."
+
+    if not detections:
+        return "Tidak ada gulma yang terdeteksi, tidak ada tindakan pengendalian yang perlu dilakukan saat ini."
+
+    weed_names = ", ".join(sorted({d["display_name"] for d in detections}))
+
+    prompt = (
+        "Kamu adalah asisten pertanian yang berperan sebagai explainer tindakan, "
+        f"bukan penyampai hasil deteksi. Gulma berikut terdeteksi pada lahan: {weed_names}.\n\n"
+        "Berdasarkan itu, tuliskan rekomendasi tindakan lanjutan dalam Bahasa Indonesia "
+        "(maksimal 4 kalimat) yang menjelaskan apa yang perlu dilakukan petani selanjutnya "
+        "(misalnya cara pengendalian, waktu penanganan, atau langkah pencegahan). "
+        "JANGAN menyebutkan nama gulma teknis, tingkat kepercayaan (confidence), tingkat "
+        "keparahan (severity), atau hasil mentah lain dari model deteksi — fokus hanya pada "
+        "tindakan yang harus dilakukan."
     )
-    return template.format(conf=round(confidence * 100))
 
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception:
+        return "Gulma terdeteksi pada lahan. Segera lakukan pengendalian gulma secara manual atau kimiawi sesuai kondisi lahan."
 
-# =========================================================================
-# DETECTION ENDPOINT
-# =========================================================================
 
 @app.post("/detect")
 async def detect(image: UploadFile = File(...)):
@@ -99,7 +91,7 @@ async def detect(image: UploadFile = File(...)):
 
     results = model.predict(
         img,
-        conf=0.20,       # low global floor; real filtering happens per-class below
+        conf=0.20,       
         iou=0.4,
         imgsz=INFERENCE_IMGSZ,
         augment=True,
@@ -118,19 +110,17 @@ async def detect(image: UploadFile = File(...)):
 
         xywh = box.xywh.tolist()[0]  # [x_center, y_center, width, height] in pixels
 
-        explanation = await get_gemini_explanation(class_name, confidence, contents)
-
         detections.append({
             "class": class_name,
             "display_name": config["display_name"],
             "confidence": round(confidence, 3),
             "bbox": xywh,
             "severity": severity_from_confidence(confidence),
-            "recommendation": config["recommendation"],
-            "explanation": explanation,
         })
 
-    return {"detections": detections, "count": len(detections)}
+    summary = await generate_summary(detections)
+
+    return {"detections": detections, "count": len(detections), "summary": summary}
 
 
 @app.get("/health")
